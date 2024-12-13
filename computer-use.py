@@ -72,7 +72,7 @@ def countdown(seconds):
     sys.stdout.flush()
 
 def touch_click(x, y, radius=20):
-    """Perform a touch-like click by clicking corners of a square around target."""
+    """Perform a touch-like click by clicking corners of a square around target simultaneously."""
     click_points = [
         (x, y),  # Center
         (x - radius, y - radius),  # Top left
@@ -81,11 +81,12 @@ def touch_click(x, y, radius=20):
         (x + radius, y + radius),  # Bottom right
     ]
     
-    # Teleport and click each point - faster clicks
+    # Move to first position
+    pyautogui.moveTo(click_points[0][0], click_points[0][1])
+    
+    # Click all points in rapid succession
     for px, py in click_points:
-        pyautogui.moveTo(px, py)
-        pyautogui.click()
-        time.sleep(0.01)  # Reduced from 0.02 to 0.01
+        pyautogui.click(px, py, _pause=False)
 
 def visualize_coordinates(points, duration=None):
     """Create a transparent overlay window showing multiple target coordinates."""
@@ -104,9 +105,19 @@ def visualize_coordinates(points, duration=None):
     canvas = Canvas(root, highlightthickness=0, bg='black')
     canvas.pack(fill='both', expand=True)
     
-    marker_size = 30  # Increased from 20 to 30
+    # Force focus
+    def ensure_focus():
+        root.focus_force()
+        root.lift()
+        if root.winfo_exists():  # Check if window still exists
+            root.after(100, ensure_focus)
+    
+    # Start focus checking after a brief delay
+    root.after(10, ensure_focus)
+    
+    marker_size = 30
     selected_coords = None
-    pulse_items = []  # Store pulse animation items
+    pulse_items = []
     
     # Create a mapping of letters to coordinates
     coord_map = {}
@@ -285,6 +296,35 @@ def type_text(text):
 
 def handle_action(search_term):
     """Handle different types of actions based on search term."""
+    # Check for combined find and type command
+    if ' and type ' in search_term.lower():
+        # Split into find and type parts
+        parts = search_term.lower().split(' and type ')
+        find_part = parts[0]
+        type_part = parts[1].strip()
+        
+        # Extract target object (remove 'find' if present)
+        if find_part.startswith('find '):
+            target = find_part[5:].strip()
+        else:
+            target = find_part.strip()
+            
+        # First find and click the target
+        screenshot_bytes = take_screenshot()
+        print(f"Looking for: {target}")
+        
+        points = get_coordinates(screenshot_bytes, target)
+        print(f"Found {len(points)} possible locations for {target}")
+        
+        selected = visualize_coordinates(points)
+        if selected:
+            print(f"Clicked at coordinates: {selected}")
+            # Now type the text
+            type_text(type_part)
+            return True
+            
+        return False
+
     # Check if it's a typing command
     if search_term.lower().startswith('type '):
         # Extract the text to type (everything after "type ")
@@ -567,6 +607,10 @@ class VoiceSearchWindow:
         self.voice_queue = queue.Queue()
         self.running = True
         
+        # Add loading spinner frames
+        self.spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self.spinner_idx = 0
+        
         # Bind escape
         self.root.bind('<Escape>', lambda e: self.stop_recognition())
         
@@ -579,44 +623,76 @@ class VoiceSearchWindow:
     
     def recognize_speech(self):
         """Run voice recognition in background thread."""
-        model = vosk.Model(lang="en-us")
+        # Try enhanced model first, fall back to default if not available
+        model_path = "vosk-model-en-us-0.22"
+        try:
+            if os.path.exists(model_path):
+                print("Using enhanced voice recognition model...")
+                model = vosk.Model(model_path)
+            else:
+                print("Using default voice recognition model...")
+                model = vosk.Model(lang="en-us")
+        except Exception as e:
+            print(f"Error loading voice model: {str(e)}")
+            print("Falling back to default voice recognition model...")
+            try:
+                model = vosk.Model(lang="en-us")
+            except Exception as e:
+                print(f"Failed to load any voice model: {str(e)}")
+                self.running = False
+                return
         
-        audio = pyaudio.PyAudio()
-        stream = audio.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=16000,
-            input=True,
-            frames_per_buffer=8000
-        )
+        try:
+            audio = pyaudio.PyAudio()
+            stream = audio.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=16000,
+                input=True,
+                frames_per_buffer=8000
+            )
+            
+            recognizer = vosk.KaldiRecognizer(model, 16000)
+            
+            while self.running:
+                data = stream.read(4000, exception_on_overflow=False)
+                if recognizer.AcceptWaveform(data):
+                    result = json.loads(recognizer.Result())
+                    if result["text"]:
+                        self.voice_queue.put(result["text"])
         
-        recognizer = vosk.KaldiRecognizer(model, 16000)
-        
-        while self.running:
-            data = stream.read(4000, exception_on_overflow=False)
-            if recognizer.AcceptWaveform(data):
-                result = json.loads(recognizer.Result())
-                if result["text"]:
-                    self.voice_queue.put(result["text"])
-        
-        stream.stop_stream()
-        stream.close()
-        audio.terminate()
+        except Exception as e:
+            print(f"Error during voice recognition: {str(e)}")
+            self.running = False
+        finally:
+            if 'stream' in locals():
+                stream.stop_stream()
+                stream.close()
+            if 'audio' in locals():
+                audio.terminate()
+    
+    def animate_loading(self, text, frames=6):
+        """Animate a loading spinner next to text."""
+        for _ in range(frames):
+            spinner = self.spinner_frames[self.spinner_idx]
+            self.text_label.config(text=f"{text} {spinner}")
+            self.root.update()
+            self.spinner_idx = (self.spinner_idx + 1) % len(self.spinner_frames)
+            time.sleep(0.05)  # 50ms per frame
     
     def check_voice_queue(self):
         """Check for new voice recognition results."""
         try:
             while True:
                 text = self.voice_queue.get_nowait()
+                # Always update the display text first
                 self.text_label.config(text=text)
+                self.root.update()  # Force update the display
                 
-                # Process voice commands
-                if "find" in text.lower():
-                    self.result = text
-                    self.stop_recognition()
-                    return
-                
-                if "type" in text.lower():
+                # Then check for commands
+                if "find" in text.lower() or "type" in text.lower():
+                    # Show loading animation
+                    self.animate_loading(text)
                     self.result = text
                     self.stop_recognition()
                     return
@@ -639,8 +715,26 @@ class VoiceSearchWindow:
 
 def main():
     """Main function handling the program flow."""
-    print("Press 'Alt+M' for text search or 'Alt+N' for voice control, Ctrl+C to exit")
+    print("\nComputer Vision-Based Object Location Tool")
+    print("----------------------------------------")
+    print("Voice Recognition:")
     
+    model_path = "vosk-model-en-us-0.22"
+    if os.path.exists(model_path):
+        print("✓ Using enhanced voice recognition model")
+    else:
+        print("! Using default voice recognition model")
+        print("\nTo install enhanced model (recommended), download using either:")
+        print("wget https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip")
+        print("curl -LO https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip")
+        print("\nThen extract to 'vosk-model-en-us-0.22' folder in script directory:")
+        print("unzip vosk-model-en-us-0.22.zip")
+    
+    print("\nControls:")
+    print("- Press 'Alt+M' for text search")
+    print("- Press 'Alt+N' for voice control")
+    print("- Press Ctrl+C to exit\n")
+
     running = True
     while running:
         try:
