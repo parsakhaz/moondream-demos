@@ -8,16 +8,15 @@ It creates a visual overlay to show where the detected object is located.
 Usage:
 ------
     1. Run the script: python computer-use.py
-    2. Press ` (backtick) to open the search window
+    2. Press Alt+M for text search or Alt+N for voice search
     3. Enter what you want to find
     4. Wait for the countdown
     5. The object location will be highlighted on screen
 
 Features:
 --------
-    - Floating search window
+    - Text and voice search interfaces
     - Hotkey-triggered activation
-    - Countdown timer before capture
     - Visual overlay with crosshair and coordinates
     - White outline for visibility on any background
     - Coordinate display in pixels
@@ -27,26 +26,23 @@ Requirements:
     - requests: For API communication
     - PIL (Pillow): For image handling
     - pyautogui: For screen capture and dimensions
-    - keyboard: For hotkey detection
+    - pynput: For global hotkeys
     - tkinter: For visualization overlay
+    - vosk: For voice recognition
 
 To install the dependencies, run:
-    pip install requests Pillow pyautogui keyboard
-
-Note: Requires a valid Moondream API key
+    pip install requests Pillow pyautogui pynput vosk
 """
 
 import os
 import requests
 from PIL import Image
 import pyautogui
-import keyboard
 import time
 import io
 import sys
 import tkinter as tk
 from tkinter import ttk
-from tkinter import Canvas
 import base64
 from io import BytesIO
 import vosk
@@ -54,6 +50,105 @@ import json
 import pyaudio
 import queue
 import threading
+from typing import Optional, List, Tuple, Dict
+from pynput import keyboard
+
+# Configuration constants
+CONFIG = {
+    'WINDOW': {
+        'WIDTH': 800,
+        'HEIGHT': 80,
+        'VOICE_HEIGHT': 120,
+    },
+    'COLORS': {
+        'BG': '#1C1C1C',
+        'TEXT': '#FFFFFF',
+        'PLACEHOLDER': '#6E7681',
+        'BORDER': '#333333',
+        'HIGHLIGHT': '#2F81F7',
+        'SHADOW': '#000000',
+    },
+    'FONTS': {
+        'MAIN': ('Segoe UI', 16),
+        'ICON': ('Segoe UI', 14),
+        'HINT': ('Segoe UI', 9),
+        'SECONDARY': ('Segoe UI', 12),
+    },
+    'API': {
+        'KEY': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJrZXlfaWQiOiI0YWQ5ODNkZC02NWIyLTRkNzMtYmMwNy1lMGQ0YWVkNWFjMzIiLCJpYXQiOjE3MzQwNTAwMzh9.GKoEaYT2_AjB6e9ZL3pczGygnWSjl7GKC08ZCJkaIVM',
+        'URL': 'https://api.moondream.ai/v1/point',
+    },
+    'VOICE': {
+        'SAMPLE_RATE': 16000,
+        'CHUNK_SIZE': 8000,
+        'READ_SIZE': 4000,
+    },
+}
+
+class BaseSearchWindow:
+    """Base class for search windows with common UI elements."""
+    
+    def __init__(self, window_height: int = CONFIG['WINDOW']['HEIGHT']):
+        self.root = tk.Tk()
+        self.root.title("")
+        self.setup_window(window_height)
+        self.setup_container()
+        self.result = None
+        
+    def setup_window(self, window_height: int) -> None:
+        """Configure window properties."""
+        self.root.attributes('-topmost', True)
+        self.root.overrideredirect(True)
+        self.root.lift()
+        
+        # Center window
+        window_width = CONFIG['WINDOW']['WIDTH']
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        center_x = int(screen_width/2 - window_width/2)
+        center_y = int(screen_height/3)
+        self.root.geometry(f'{window_width}x{window_height}+{center_x}+{center_y}')
+        self.root.configure(bg=CONFIG['COLORS']['BG'])
+        
+    def setup_container(self) -> None:
+        """Set up the main container frame."""
+        self.container = tk.Frame(
+            self.root,
+            bg=CONFIG['COLORS']['BG'],
+            highlightbackground=CONFIG['COLORS']['BORDER'],
+            highlightthickness=1,
+        )
+        self.add_shadow()
+        self.container.pack(fill='both', expand=True, padx=1, pady=1)
+        
+    def add_shadow(self) -> None:
+        """Add drop shadow effect to window."""
+        shadow_size = 5
+        for i in range(shadow_size):
+            alpha = 0.1 - (i * 0.02)
+            shadow = tk.Frame(
+                self.root,
+                bg=CONFIG['COLORS']['SHADOW'],
+                height=2,
+            )
+            shadow.place(x=0, y=shadow_size+i, relwidth=1)
+            shadow.lift()
+            
+    def add_shortcut_hint(self, text: str) -> None:
+        """Add shortcut hint label."""
+        self.shortcut_label = tk.Label(
+            self.container,
+            text=text,
+            font=CONFIG['FONTS']['HINT'],
+            fg=CONFIG['COLORS']['PLACEHOLDER'],
+            bg=CONFIG['COLORS']['BG']
+        )
+        self.shortcut_label.pack(side='right', padx=(0, 15), pady=0)
+        
+    def get_search_term(self) -> Optional[str]:
+        """Run the window and return the search term."""
+        self.root.mainloop()
+        return self.result
 
 def countdown(seconds):
     """Display a countdown timer in the console before taking screenshot.
@@ -71,393 +166,389 @@ def countdown(seconds):
     sys.stdout.write('\rTaking screenshot now!      \n')
     sys.stdout.flush()
 
-def touch_click(x, y, radius=20):
-    """Perform a touch-like click by clicking corners of a square around target simultaneously."""
-    click_points = [
-        (x, y),  # Center
-        (x - radius, y - radius),  # Top left
-        (x + radius, y - radius),  # Top right
-        (x - radius, y + radius),  # Bottom left
-        (x + radius, y + radius),  # Bottom right
-    ]
+class ScreenHandler:
+    """Class for handling screen capture and coordinate operations."""
     
-    # Move to first position
-    pyautogui.moveTo(click_points[0][0], click_points[0][1])
-    
-    # Click all points in rapid succession
-    for px, py in click_points:
-        pyautogui.click(px, py, _pause=False)
-
-def visualize_coordinates(points, duration=None):
-    """Create a transparent overlay window showing multiple target coordinates."""
-    root = tk.Tk()
-    root.attributes('-alpha', 0.7)
-    root.attributes('-topmost', True)
-    root.attributes('-fullscreen', True)
-    root.lift()
-    
-    # Make window click-through
-    root.attributes('-transparentcolor', 'black')
-    root.config(bg='black')
-    root.wm_attributes('-disabled', True)
-    
-    # Create canvas with transparent background
-    canvas = Canvas(root, highlightthickness=0, bg='black')
-    canvas.pack(fill='both', expand=True)
-    
-    # Force focus
-    def ensure_focus():
-        root.focus_force()
-        root.lift()
-        if root.winfo_exists():  # Check if window still exists
-            root.after(100, ensure_focus)
-    
-    # Start focus checking after a brief delay
-    root.after(10, ensure_focus)
-    
-    marker_size = 30
-    selected_coords = None
-    pulse_items = []
-    
-    # Create a mapping of letters to coordinates
-    coord_map = {}
-    for idx, (x, y) in enumerate(points):
-        letter = chr(65 + idx)
-        coord_map[letter.lower()] = (x, y)
-        coord_map[letter.upper()] = (x, y)
+    @staticmethod
+    def take_screenshot() -> bytes:
+        """Capture the current screen.
         
-        # Draw outer glow (white outline for visibility)
-        outer_glow = canvas.create_oval(x-marker_size-4, y-marker_size-4, 
-                                      x+marker_size+4, y+marker_size+4, 
-                                      outline='white', width=6)  # Thicker outline
-        canvas.create_line(x-marker_size*2-4, y, x+marker_size*2+4, y, 
-                         fill='white', width=6)  # Thicker lines
-        canvas.create_line(x, y-marker_size*2-4, x, y+marker_size*2+4, 
-                         fill='white', width=6)
-        
-        # Draw main crosshair (red)
-        inner_circle = canvas.create_oval(x-marker_size, y-marker_size, 
-                                        x+marker_size, y+marker_size, 
-                                        outline='red', width=4)  # Thicker outline
-        canvas.create_line(x-marker_size*2, y, x+marker_size*2, y, 
-                         fill='red', width=4)
-        canvas.create_line(x, y-marker_size*2, x, y+marker_size*2, 
-                         fill='red', width=4)
-        
-        # Add pulsing circle
-        pulse = canvas.create_oval(x-marker_size-2, y-marker_size-2,
-                                 x+marker_size+2, y+marker_size+2,
-                                 outline='#FF4444', width=3)
-        pulse_items.append((pulse, x, y))
-
-        # Add letter and coordinate text
-        canvas.create_text(x, y - marker_size*2 - 25,  # Adjusted for larger marker
-                         text=f"{letter}", 
-                         fill='yellow', 
-                         font=('Arial', 28, 'bold'))  # Larger font
-        canvas.create_text(x, y + marker_size*2 + 25, 
-                         text=f"({x}, {y})", 
-                         fill='white', 
-                         font=('Arial', 14))  # Larger font
-
-    # Pulse animation
-    pulse_size = 0
-    pulse_growing = True
-    def animate_pulse():
-        nonlocal pulse_size, pulse_growing
-        
-        if pulse_growing:
-            pulse_size += 1
-            if pulse_size >= 20:  # Max pulse size
-                pulse_growing = False
-        else:
-            pulse_size -= 1
-            if pulse_size <= 0:
-                pulse_growing = True
-        
-        # Update all pulse circles
-        for pulse, x, y in pulse_items:
-            canvas.coords(pulse,
-                        x-marker_size-2-pulse_size, y-marker_size-2-pulse_size,
-                        x+marker_size+2+pulse_size, y+marker_size+2+pulse_size)
-        
-        root.after(20, animate_pulse)  # Update every 20ms
-
-    # Start pulse animation
-    animate_pulse()
+        Returns:
+            bytes: Screenshot image data in PNG format
+        """
+        screenshot = pyautogui.screenshot()
+        img_byte_arr = BytesIO()
+        screenshot.save(img_byte_arr, format='PNG')
+        return img_byte_arr.getvalue()
     
-    def on_key(event):
-        nonlocal selected_coords
-        key = event.char
-        if key in coord_map:
-            selected_coords = coord_map[key]
-            root.quit()
-        elif event.keysym == 'Escape':
-            root.quit()
-
-    # Add instructions
-    instructions = "Press letter (A-{}) to select point to click, ESC to cancel".format(
-        chr(64 + len(points))
-    )
-    canvas.create_text(root.winfo_screenwidth()//2, 50,
-                      text=instructions,
-                      fill='white',
-                      font=('Arial', 18))  # Larger font
-
-    # Bind keyboard events
-    root.bind('<Key>', on_key)
-    root.focus_force()
-
-    # Run the window
-    root.mainloop()
-    root.destroy()
-    
-    # Click the selected coordinates after window is closed
-    if selected_coords:
-        time.sleep(0.05)
-        touch_click(*selected_coords)
-    
-    return selected_coords
-
-def get_coordinates(image_bytes, target_object):
-    """Get coordinates using Moondream API."""
-    api_key = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJrZXlfaWQiOiI0YWQ5ODNkZC02NWIyLTRkNzMtYmMwNy1lMGQ0YWVkNWFjMzIiLCJpYXQiOjE3MzQwNTAwMzh9.GKoEaYT2_AjB6e9ZL3pczGygnWSjl7GKC08ZCJkaIVM'
-    if not api_key:
-        raise ValueError("Please set MOONDREAM_API_KEY environment variable")
-
-    # Convert image to base64
-    base64_image = base64.b64encode(image_bytes).decode('utf-8')
-    
-    # API endpoint
-    url = "https://api.moondream.ai/v1/point"
-    
-    headers = {
-        "X-Moondream-Auth": api_key,
-        "Content-Type": "application/json"
-    }
-    
-    data = {
-        "image_url": f"data:image/jpeg;base64,{base64_image}",
-        "object": target_object,
-        "stream": False
-    }
-    
-    try:
-        response = requests.post(url, headers=headers, json=data)
-        response.raise_for_status()
+    @staticmethod
+    def get_coordinates(image_bytes: bytes, target_object: str) -> List[Tuple[int, int]]:
+        """Get coordinates using Moondream API.
         
-        result = response.json()
-        print(f"API Response: {result}")
-        
-        if not result or 'points' not in result or not result['points']:
-            raise ValueError(f"No coordinates found for '{target_object}'")
-        
-        points = result['points']
-        
-        # Get screen dimensions
-        screen_width, screen_height = pyautogui.size()
-        print(f"Screen size: {screen_width}x{screen_height}")
-        
-        # Convert all normalized coordinates to screen coordinates
-        screen_points = []
-        for point in points:
-            x = int(float(point["x"]) * screen_width)
-            y = int(float(point["y"]) * screen_height)
-            screen_points.append((x, y))
+        Args:
+            image_bytes: Screenshot image data
+            target_object: Object to locate in the image
             
-        print(f"Found {len(screen_points)} possible locations")
-        return screen_points
+        Returns:
+            List of (x, y) coordinate tuples
+            
+        Raises:
+            ValueError: If API key is missing or no coordinates found
+            requests.exceptions.RequestException: If API request fails
+        """
+        api_key = CONFIG['API']['KEY']
+        if not api_key:
+            raise ValueError("Please set MOONDREAM_API_KEY environment variable")
         
-    except requests.exceptions.RequestException as e:
-        print(f"API Request Failed: {e}")
-        if hasattr(e.response, 'text'):
-            print(f"Response content: {e.response.text}")
-        raise
-
-def take_screenshot():
-    """Capture the current screen.
+        # Convert image to base64
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        
+        headers = {
+            "X-Moondream-Auth": api_key,
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "image_url": f"data:image/jpeg;base64,{base64_image}",
+            "object": target_object,
+            "stream": False
+        }
+        
+        try:
+            response = requests.post(CONFIG['API']['URL'], headers=headers, json=data)
+            response.raise_for_status()
+            
+            result = response.json()
+            print(f"API Response: {result}")
+            
+            if not result or 'points' not in result or not result['points']:
+                raise ValueError(f"No coordinates found for '{target_object}'")
+            
+            # Convert normalized coordinates to screen coordinates
+            screen_width, screen_height = pyautogui.size()
+            print(f"Screen size: {screen_width}x{screen_height}")
+            
+            screen_points = []
+            for point in result['points']:
+                x = int(float(point["x"]) * screen_width)
+                y = int(float(point["y"]) * screen_height)
+                screen_points.append((x, y))
+            
+            print(f"Found {len(screen_points)} possible locations")
+            return screen_points
+            
+        except requests.exceptions.RequestException as e:
+            print(f"API Request Failed: {e}")
+            if hasattr(e.response, 'text'):
+                print(f"Response content: {e.response.text}")
+            raise
     
-    Returns:
-        bytes: Screenshot image data in PNG format
+    @staticmethod
+    def touch_click(x: int, y: int, radius: int = 20) -> None:
+        """Perform a touch-like click by clicking corners of a square around target.
+        
+        Args:
+            x: X coordinate to click
+            y: Y coordinate to click
+            radius: Radius of the click area
+        """
+        click_points = [
+            (x, y),  # Center
+            (x - radius, y - radius),  # Top left
+            (x + radius, y - radius),  # Top right
+            (x - radius, y + radius),  # Bottom left
+            (x + radius, y + radius),  # Bottom right
+        ]
+        
+        # Move to first position
+        pyautogui.moveTo(click_points[0][0], click_points[0][1])
+        
+        # Click all points in rapid succession
+        for px, py in click_points:
+            pyautogui.click(px, py, _pause=False)
     
-    The screenshot is taken of the entire screen and converted
-    to bytes for API transmission.
-    """
-    screenshot = pyautogui.screenshot()
-    # Convert to bytes
-    img_byte_arr = BytesIO()
-    screenshot.save(img_byte_arr, format='PNG')
-    return img_byte_arr.getvalue()
+    @staticmethod
+    def type_text(text: str) -> None:
+        """Type text at current cursor position with a natural delay.
+        
+        Args:
+            text: Text to type
+        """
+        time.sleep(0.3)  # Let UI settle
+        pyautogui.write(text, interval=0.02)
 
-def type_text(text):
-    """Type text at current cursor position with a natural delay."""
-    time.sleep(0.3)  # Reduced from 1.0 to 0.3 - just enough to let UI settle
-    pyautogui.write(text, interval=0.02)  # Reduced from 0.05 to 0.02
+class CoordinateVisualizer:
+    """Class for visualizing coordinates on screen with interactive selection."""
+    
+    def __init__(self, points: List[Tuple[int, int]]):
+        self.points = points
+        self.marker_size = 30
+        self.pulse_items = []
+        self.selected_coords = None
+        self.root = tk.Tk()
+        self.setup_window()
+        
+    def setup_window(self) -> None:
+        """Set up the visualization window."""
+        self.root.attributes('-alpha', 0.7)
+        self.root.attributes('-topmost', True)
+        self.root.attributes('-fullscreen', True)
+        self.root.lift()
+        
+        # Make window click-through
+        self.root.attributes('-transparentcolor', 'black')
+        self.root.config(bg='black')
+        self.root.wm_attributes('-disabled', True)
+        
+        # Create canvas
+        self.canvas = tk.Canvas(self.root, highlightthickness=0, bg='black')
+        self.canvas.pack(fill='both', expand=True)
+        
+        # Create coordinate mapping
+        self.coord_map = {}
+        for idx, (x, y) in enumerate(self.points):
+            letter = chr(65 + idx)
+            self.coord_map[letter.lower()] = (x, y)
+            self.coord_map[letter.upper()] = (x, y)
+            self.draw_marker(x, y, letter)
+        
+        # Add instructions
+        self.add_instructions()
+        
+        # Bind events
+        self.root.bind('<Key>', self.on_key)
+        self.root.focus_force()
+        
+        # Start animation
+        self.pulse_size = 0
+        self.pulse_growing = True
+        self.animate_pulse()
+    
+    def draw_marker(self, x: int, y: int, letter: str) -> None:
+        """Draw a single coordinate marker."""
+        # Outer white glow for visibility
+        self.canvas.create_oval(
+            x-self.marker_size-4, y-self.marker_size-4,
+            x+self.marker_size+4, y+self.marker_size+4,
+            outline='white', width=6
+        )
+        self.canvas.create_line(
+            x-self.marker_size*2-4, y,
+            x+self.marker_size*2+4, y,
+            fill='white', width=6
+        )
+        self.canvas.create_line(
+            x, y-self.marker_size*2-4,
+            x, y+self.marker_size*2+4,
+            fill='white', width=6
+        )
+        
+        # Red crosshair
+        self.canvas.create_oval(
+            x-self.marker_size, y-self.marker_size,
+            x+self.marker_size, y+self.marker_size,
+            outline='red', width=4
+        )
+        self.canvas.create_line(
+            x-self.marker_size*2, y,
+            x+self.marker_size*2, y,
+            fill='red', width=4
+        )
+        self.canvas.create_line(
+            x, y-self.marker_size*2,
+            x, y+self.marker_size*2,
+            fill='red', width=4
+        )
+        
+        # Pulsing circle
+        pulse = self.canvas.create_oval(
+            x-self.marker_size-2, y-self.marker_size-2,
+            x+self.marker_size+2, y+self.marker_size+2,
+            outline='#FF4444', width=3
+        )
+        self.pulse_items.append((pulse, x, y))
+        
+        # Letter and coordinates
+        self.canvas.create_text(
+            x, y - self.marker_size*2 - 25,
+            text=letter,
+            fill='yellow',
+            font=('Arial', 28, 'bold')
+        )
+        self.canvas.create_text(
+            x, y + self.marker_size*2 + 25,
+            text=f"({x}, {y})",
+            fill='white',
+            font=('Arial', 14)
+        )
+    
+    def add_instructions(self) -> None:
+        """Add instruction text to the visualization."""
+        instructions = "Press letter (A-{}) to select point to click, ESC to cancel".format(
+            chr(64 + len(self.points))
+        )
+        self.canvas.create_text(
+            self.root.winfo_screenwidth()//2, 50,
+            text=instructions,
+            fill='white',
+            font=('Arial', 18)
+        )
+    
+    def animate_pulse(self) -> None:
+        """Animate the pulsing circles."""
+        if self.pulse_growing:
+            self.pulse_size += 1
+            if self.pulse_size >= 20:
+                self.pulse_growing = False
+        else:
+            self.pulse_size -= 1
+            if self.pulse_size <= 0:
+                self.pulse_growing = True
+        
+        for pulse, x, y in self.pulse_items:
+            self.canvas.coords(
+                pulse,
+                x-self.marker_size-2-self.pulse_size,
+                y-self.marker_size-2-self.pulse_size,
+                x+self.marker_size+2+self.pulse_size,
+                y+self.marker_size+2+self.pulse_size
+            )
+        
+        if self.root.winfo_exists():
+            self.root.after(20, self.animate_pulse)
+    
+    def on_key(self, event: tk.Event) -> None:
+        """Handle key press events."""
+        if event.char in self.coord_map:
+            self.selected_coords = self.coord_map[event.char]
+            self.root.quit()
+        elif event.keysym == 'Escape':
+            self.root.quit()
+    
+    def show(self) -> Optional[Tuple[int, int]]:
+        """Show the visualization and return selected coordinates."""
+        self.root.mainloop()
+        self.root.destroy()
+        
+        if self.selected_coords:
+            time.sleep(0.05)
+            ScreenHandler.touch_click(*self.selected_coords)
+        
+        return self.selected_coords
 
-def handle_action(search_term):
-    """Handle different types of actions based on search term."""
-    # Check for combined find and type command
-    if ' and type ' in search_term.lower():
-        # Split into find and type parts
+class ActionHandler:
+    """Class for handling different types of user actions."""
+    
+    @staticmethod
+    def handle_action(search_term: str) -> bool:
+        """Handle different types of actions based on search term."""
+        if ' and type ' in search_term.lower():
+            return ActionHandler._handle_find_and_type(search_term)
+        elif search_term.lower().startswith('type '):
+            return ActionHandler._handle_type(search_term[5:].strip())
+        else:
+            return ActionHandler._handle_find(search_term)
+    
+    @staticmethod
+    def _handle_find_and_type(search_term: str) -> bool:
+        """Handle combined find and type action."""
         parts = search_term.lower().split(' and type ')
         find_part = parts[0]
         type_part = parts[1].strip()
         
-        # Extract target object (remove 'find' if present)
-        if find_part.startswith('find '):
-            target = find_part[5:].strip()
-        else:
-            target = find_part.strip()
-            
+        # Extract target object
+        target = find_part[5:].strip() if find_part.startswith('find ') else find_part.strip()
+        
         # First find and click the target
-        screenshot_bytes = take_screenshot()
+        screenshot_bytes = ScreenHandler.take_screenshot()
         print(f"Looking for: {target}")
         
-        points = get_coordinates(screenshot_bytes, target)
-        print(f"Found {len(points)} possible locations for {target}")
-        
-        selected = visualize_coordinates(points)
-        if selected:
-            print(f"Clicked at coordinates: {selected}")
-            # Now type the text
-            type_text(type_part)
-            return True
+        try:
+            points = ScreenHandler.get_coordinates(screenshot_bytes, target)
+            print(f"Found {len(points)} possible locations for {target}")
             
-        return False
-
-    # Check if it's a typing command
-    if search_term.lower().startswith('type '):
-        # Extract the text to type (everything after "type ")
-        text_to_type = search_term[5:].strip()
+            visualizer = CoordinateVisualizer(points)
+            if visualizer.show():
+                ScreenHandler.type_text(type_part)
+                return True
+        except Exception as e:
+            print(f"Error during find and type: {str(e)}")
         
-        # First find a text box
-        screenshot_bytes = take_screenshot()
+        return False
+    
+    @staticmethod
+    def _handle_type(text: str) -> bool:
+        """Handle type action."""
+        screenshot_bytes = ScreenHandler.take_screenshot()
         print("Looking for text box...")
         
-        points = get_coordinates(screenshot_bytes, "text box")
-        print(f"Found {len(points)} possible text box locations")
-        
-        # Show and select text box location
-        selected = visualize_coordinates(points)
-        if selected:
-            print(f"Selected text box at: {selected}")
-            touch_click(*selected)
-            type_text(text_to_type)
-            return True
+        try:
+            points = ScreenHandler.get_coordinates(screenshot_bytes, "text box")
+            print(f"Found {len(points)} possible text box locations")
             
+            visualizer = CoordinateVisualizer(points)
+            if visualizer.show():
+                ScreenHandler.type_text(text)
+                return True
+        except Exception as e:
+            print(f"Error during type: {str(e)}")
+        
         return False
     
-    # Check if it's a find command
-    if search_term.lower().startswith('find '):
-        # Extract what to find (everything after "find ")
-        target = search_term[5:].strip()
-    else:
-        # If "find" appears anywhere in the text, use everything after it
-        find_idx = search_term.lower().find('find ')
-        if find_idx >= 0:
-            target = search_term[find_idx + 5:].strip()
-        else:
-            target = search_term
-    
-    # Default behavior - find and click
-    screenshot_bytes = take_screenshot()
-    print(f"Looking for: {target}")
-    
-    points = get_coordinates(screenshot_bytes, target)
-    print(f"Found {len(points)} possible locations for {target}")
-    
-    selected = visualize_coordinates(points)
-    if selected:
-        print(f"Clicked at coordinates: {selected}")
-        return True
-    
-    return False
+    @staticmethod
+    def _handle_find(search_term: str) -> bool:
+        """Handle find action."""
+        # Extract target from search term
+        target = search_term[5:].strip() if search_term.lower().startswith('find ') else search_term
+        
+        screenshot_bytes = ScreenHandler.take_screenshot()
+        print(f"Looking for: {target}")
+        
+        try:
+            points = ScreenHandler.get_coordinates(screenshot_bytes, target)
+            print(f"Found {len(points)} possible locations for {target}")
+            
+            visualizer = CoordinateVisualizer(points)
+            return visualizer.show() is not None
+        except Exception as e:
+            print(f"Error during find: {str(e)}")
+        
+        return False
 
-class SearchWindow:
+class SearchWindow(BaseSearchWindow):
     """Modern Vercel-style command palette."""
     
     def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("")
-        
-        # Make window float on top and remove decorations
-        self.root.attributes('-topmost', True)
-        self.root.overrideredirect(True)
-        self.root.lift()
-        
-        # Set up modern dark theme colors
-        self.bg_color = '#1C1C1C'  # Dark background
-        self.text_color = '#FFFFFF'  # White text
-        self.placeholder_color = '#6E7681'  # Gray placeholder
-        self.border_color = '#333333'  # Subtle border
-        self.highlight_color = '#2F81F7'  # Blue highlight
-        
-        # Center the window
-        window_width = 800
-        window_height = 80  # Slightly shorter for better proportions
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        center_x = int(screen_width/2 - window_width/2)
-        center_y = int(screen_height/3)
-        self.root.geometry(f'{window_width}x{window_height}+{center_x}+{center_y}')
-        
-        # Configure root background and border
-        self.root.configure(bg=self.bg_color)
-        
-        # Create main container with padding and shadow effect
-        self.container = tk.Frame(
-            self.root,
-            bg=self.bg_color,
-            highlightbackground=self.border_color,
-            highlightthickness=1,
-        )
-        
-        # Add drop shadow
-        shadow_frames = []
-        shadow_size = 5
-        shadow_color = '#000000'
-        
-        for i in range(shadow_size):
-            alpha = 0.1 - (i * 0.02)
-            shadow = tk.Frame(
-                self.root,
-                bg=shadow_color,
-                height=2,
-            )
-            shadow.place(x=0, y=shadow_size+i, relwidth=1)
-            shadow.lift()
-            shadow_frames.append(shadow)
-        
-        self.container.pack(fill='both', expand=True, padx=1, pady=1)
+        super().__init__(CONFIG['WINDOW']['HEIGHT'])
         
         # Search icon (⌘)
         self.icon_label = tk.Label(
             self.container,
             text="⌘",
-            font=('Segoe UI', 14),  # Slightly smaller icon
-            fg=self.placeholder_color,
-            bg=self.bg_color
+            font=CONFIG['FONTS']['ICON'],
+            fg=CONFIG['COLORS']['PLACEHOLDER'],
+            bg=CONFIG['COLORS']['BG']
         )
-        self.icon_label.pack(side='left', padx=(15, 5), pady=0)  # Adjusted padding
+        self.icon_label.pack(side='left', padx=(15, 5), pady=0)
         
         # Custom Entry widget
         self.search_var = tk.StringVar()
         self.entry = tk.Entry(
             self.container,
             textvariable=self.search_var,
-            font=('Segoe UI', 16),
-            fg=self.text_color,
-            bg=self.bg_color,
-            insertbackground=self.text_color,
+            font=CONFIG['FONTS']['MAIN'],
+            fg=CONFIG['COLORS']['TEXT'],
+            bg=CONFIG['COLORS']['BG'],
+            insertbackground=CONFIG['COLORS']['TEXT'],
             relief='flat',
             highlightthickness=0,
             bd=0
         )
-        self.entry.pack(fill='x', expand=True, padx=(5, 15), pady=(20, 20))  # Centered vertically
+        self.entry.pack(fill='x', expand=True, padx=(5, 15), pady=(20, 20))
         
         # Add placeholder
         self.entry.insert(0, "Type to find anything...")
-        self.entry.config(fg=self.placeholder_color)
+        self.entry.config(fg=CONFIG['COLORS']['PLACEHOLDER'])
         
         # Bind events
         self.entry.bind('<FocusIn>', self.on_entry_click)
@@ -466,108 +557,146 @@ class SearchWindow:
         self.root.bind('<Escape>', lambda e: self.root.destroy())
         
         # Add shortcut hint
-        self.shortcut_label = tk.Label(
-            self.container,
-            text="alt+m to open, esc to close",
-            font=('Segoe UI', 9),
-            fg=self.placeholder_color,
-            bg=self.bg_color
-        )
-        self.shortcut_label.pack(side='right', padx=(0, 15), pady=0)
-        
-        self.result = None
+        self.add_shortcut_hint("alt+m to open, esc to close")
         
         # Ensure focus
         self.root.update_idletasks()
         self.root.lift()
         self.entry.focus_force()
         
-        # Click to focus - faster initial display
-        def click_entry():
-            x = center_x + window_width//2
-            y = center_y + window_height//2
-            pyautogui.click(x, y)
+        # Keep focused
+        self._focus_check_id = None
+        self.ensure_focus()
+    
+    def ensure_focus(self):
+        """Ensure window stays focused."""
+        if self.root.winfo_exists():
+            self.root.lift()
             self.entry.focus_force()
-        
-        self.root.after(50, click_entry)  # Reduced from 100 to 50ms
-        
-        # Keep focused - check more frequently
-        def ensure_focus():
-            if not self.root.focus_get():
-                self.root.lift()
-                self.entry.focus_force()
-            self.root.after(25, ensure_focus)  # Reduced from 50 to 25ms
-        
-        self.root.after(1, ensure_focus)
+            self._focus_check_id = self.root.after(100, self.ensure_focus)
     
     def on_entry_click(self, event):
         """Handle entry field click."""
         if self.entry.get() == "Type to find anything...":
             self.entry.delete(0, tk.END)
-            self.entry.config(fg=self.text_color)
+            self.entry.config(fg=CONFIG['COLORS']['TEXT'])
     
     def on_focus_out(self, event):
         """Handle focus out."""
         if not self.entry.get():
             self.entry.insert(0, "Type to find anything...")
-            self.entry.config(fg=self.placeholder_color)
+            self.entry.config(fg=CONFIG['COLORS']['PLACEHOLDER'])
     
     def submit(self):
         """Handle submission."""
         text = self.search_var.get()
         if text and text != "Type to find anything...":
             self.result = text
+            if self._focus_check_id:
+                self.root.after_cancel(self._focus_check_id)
             self.root.destroy()
     
     def get_search_term(self):
         """Run the window and return the search term."""
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            if self._focus_check_id:
+                self.root.after_cancel(self._focus_check_id)
         return self.result
 
-class VoiceSearchWindow:
+class VoiceRecognizer:
+    """Class for handling voice recognition functionality."""
+    
+    def __init__(self, callback):
+        self.callback = callback
+        self.running = True
+        self.recognition_thread = None
+        self.last_text = ""
+        self.last_speech_time = time.time()
+        self.silence_threshold = 0.8  # Reduced from 1.5 to 0.8 seconds for faster response
+    
+    def start(self):
+        """Start voice recognition in a separate thread."""
+        self.running = True
+        self.recognition_thread = threading.Thread(target=self._recognize_speech)
+        self.recognition_thread.daemon = True  # Make thread daemon so it exits with main program
+        self.recognition_thread.start()
+    
+    def stop(self):
+        """Stop voice recognition."""
+        self.running = False
+        # Don't join the thread if we're in it
+        if (self.recognition_thread and 
+            threading.current_thread() is not self.recognition_thread):
+            self.recognition_thread.join(timeout=1.0)  # Wait up to 1 second
+    
+    def _recognize_speech(self):
+        """Run voice recognition in background thread."""
+        try:
+            model = vosk.Model(lang="en-us")
+            
+            audio = pyaudio.PyAudio()
+            stream = audio.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=CONFIG['VOICE']['SAMPLE_RATE'],
+                input=True,
+                frames_per_buffer=CONFIG['VOICE']['CHUNK_SIZE']
+            )
+            
+            recognizer = vosk.KaldiRecognizer(model, CONFIG['VOICE']['SAMPLE_RATE'])
+            
+            while self.running:
+                try:
+                    data = stream.read(CONFIG['VOICE']['READ_SIZE'], exception_on_overflow=False)
+                    if recognizer.AcceptWaveform(data):
+                        result = json.loads(recognizer.Result())
+                        text = result.get("text", "").strip()
+                        
+                        # If we got text, update the last speech time
+                        if text:
+                            self.last_speech_time = time.time()
+                            self.last_text = text
+                            self.callback(text, final=False)
+                        # If we've had silence for a while and have previous text
+                        elif self.last_text and (time.time() - self.last_speech_time) > self.silence_threshold:
+                            self.callback(self.last_text, final=True)
+                            self.last_text = ""
+                            
+                except Exception as e:
+                    print(f"Error reading audio data: {str(e)}")
+                    break
+        
+        except Exception as e:
+            print(f"Error during voice recognition: {str(e)}")
+        finally:
+            self.running = False
+            if 'stream' in locals():
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except:
+                    pass
+            if 'audio' in locals():
+                try:
+                    audio.terminate()
+                except:
+                    pass
+
+class VoiceSearchWindow(BaseSearchWindow):
     """Voice-controlled command palette for accessibility."""
     
     def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("")
-        
-        # Use same styling as text SearchWindow for consistency
-        self.bg_color = '#1C1C1C'
-        self.text_color = '#FFFFFF'
-        self.placeholder_color = '#6E7681'
-        self.border_color = '#333333'
-        self.highlight_color = '#2F81F7'
-        
-        # Configure window
-        window_width = 800
-        window_height = 120  # Slightly taller to show more feedback
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        center_x = int(screen_width/2 - window_width/2)
-        center_y = int(screen_height/3)
-        self.root.geometry(f'{window_width}x{window_height}+{center_x}+{center_y}')
-        
-        # Setup window attributes
-        self.root.attributes('-topmost', True)
-        self.root.overrideredirect(True)
-        self.root.configure(bg=self.bg_color)
-        
-        # Create container
-        self.container = tk.Frame(
-            self.root,
-            bg=self.bg_color,
-            highlightbackground=self.border_color,
-            highlightthickness=1,
-        )
-        self.container.pack(fill='both', expand=True, padx=1, pady=1)
+        super().__init__(CONFIG['WINDOW']['VOICE_HEIGHT'])
         
         # Microphone icon
         self.icon_label = tk.Label(
             self.container,
             text="🎤",
-            font=('Segoe UI', 14),
-            fg=self.text_color,
-            bg=self.bg_color
+            font=CONFIG['FONTS']['ICON'],
+            fg=CONFIG['COLORS']['TEXT'],
+            bg=CONFIG['COLORS']['BG']
         )
         self.icon_label.pack(side='left', padx=(15, 5), pady=0)
         
@@ -575,9 +704,9 @@ class VoiceSearchWindow:
         self.status_label = tk.Label(
             self.container,
             text="Listening...",
-            font=('Segoe UI', 16),
-            fg=self.text_color,
-            bg=self.bg_color
+            font=CONFIG['FONTS']['MAIN'],
+            fg=CONFIG['COLORS']['TEXT'],
+            bg=CONFIG['COLORS']['BG']
         )
         self.status_label.pack(fill='x', expand=True, padx=(5, 15), pady=(10, 0))
         
@@ -585,191 +714,215 @@ class VoiceSearchWindow:
         self.text_label = tk.Label(
             self.container,
             text="",
-            font=('Segoe UI', 12),
-            fg=self.placeholder_color,
-            bg=self.bg_color,
-            wraplength=window_width-60
+            font=CONFIG['FONTS']['SECONDARY'],
+            fg=CONFIG['COLORS']['PLACEHOLDER'],
+            bg=CONFIG['COLORS']['BG'],
+            wraplength=CONFIG['WINDOW']['WIDTH']-60
         )
         self.text_label.pack(fill='x', expand=True, padx=(5, 15), pady=(0, 10))
         
-        # Shortcut hint
-        self.shortcut_label = tk.Label(
-            self.container,
-            text="esc to cancel",
-            font=('Segoe UI', 9),
-            fg=self.placeholder_color,
-            bg=self.bg_color
-        )
-        self.shortcut_label.pack(side='right', padx=(0, 15), pady=0)
-        
-        # Voice recognition setup
-        self.result = None
-        self.voice_queue = queue.Queue()
-        self.running = True
+        # Add shortcut hint
+        self.add_shortcut_hint("esc to cancel")
         
         # Add loading spinner frames
         self.spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
         self.spinner_idx = 0
         
-        # Bind escape
+        # Bind escape and window close
         self.root.bind('<Escape>', lambda e: self.stop_recognition())
+        self.root.protocol("WM_DELETE_WINDOW", self.stop_recognition)
         
-        # Start recognition in separate thread
-        self.recognition_thread = threading.Thread(target=self.recognize_speech)
-        self.recognition_thread.start()
+        # Initialize voice recognition
+        self.recognizer = VoiceRecognizer(self._on_voice_result)
+        self.recognizer.start()
         
-        # Update UI periodically
-        self.root.after(100, self.check_voice_queue)
+        # Keep focused
+        self._focus_check_id = None
+        self.ensure_focus()
     
-    def recognize_speech(self):
-        """Run voice recognition in background thread."""
-        # Try enhanced model first, fall back to default if not available
-        model_path = "vosk-model-en-us-0.22"
-        try:
-            if os.path.exists(model_path):
-                print("Using enhanced voice recognition model...")
-                model = vosk.Model(model_path)
-            else:
-                print("Using default voice recognition model...")
-                model = vosk.Model(lang="en-us")
-        except Exception as e:
-            print(f"Error loading voice model: {str(e)}")
-            print("Falling back to default voice recognition model...")
-            try:
-                model = vosk.Model(lang="en-us")
-            except Exception as e:
-                print(f"Failed to load any voice model: {str(e)}")
-                self.running = False
-                return
-        
-        try:
-            audio = pyaudio.PyAudio()
-            stream = audio.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=16000,
-                input=True,
-                frames_per_buffer=8000
-            )
+    def ensure_focus(self):
+        """Ensure window stays focused."""
+        if self.root.winfo_exists():
+            self.root.lift()
+            self._focus_check_id = self.root.after(100, self.ensure_focus)
+    
+    def _on_voice_result(self, text, final=False):
+        """Handle voice recognition results."""
+        if not self.root.winfo_exists():
+            return
             
-            recognizer = vosk.KaldiRecognizer(model, 16000)
-            
-            while self.running:
-                data = stream.read(4000, exception_on_overflow=False)
-                if recognizer.AcceptWaveform(data):
-                    result = json.loads(recognizer.Result())
-                    if result["text"]:
-                        self.voice_queue.put(result["text"])
+        # Always update the display text first
+        self.text_label.config(text=text)
+        self.root.update()  # Force update the display
         
-        except Exception as e:
-            print(f"Error during voice recognition: {str(e)}")
-            self.running = False
-        finally:
-            if 'stream' in locals():
-                stream.stop_stream()
-                stream.close()
-            if 'audio' in locals():
-                audio.terminate()
+        # Only process the command if it's final or contains a trigger word
+        if final and ("find" in text.lower() or "type" in text.lower()):
+            # Show loading animation
+            self.animate_loading(text)
+            self.result = text
+            self.stop_recognition()
     
     def animate_loading(self, text, frames=6):
         """Animate a loading spinner next to text."""
         for _ in range(frames):
+            if not self.root.winfo_exists():
+                break
             spinner = self.spinner_frames[self.spinner_idx]
             self.text_label.config(text=f"{text} {spinner}")
             self.root.update()
             self.spinner_idx = (self.spinner_idx + 1) % len(self.spinner_frames)
-            time.sleep(0.05)  # 50ms per frame
-    
-    def check_voice_queue(self):
-        """Check for new voice recognition results."""
-        try:
-            while True:
-                text = self.voice_queue.get_nowait()
-                # Always update the display text first
-                self.text_label.config(text=text)
-                self.root.update()  # Force update the display
-                
-                # Then check for commands
-                if "find" in text.lower() or "type" in text.lower():
-                    # Show loading animation
-                    self.animate_loading(text)
-                    self.result = text
-                    self.stop_recognition()
-                    return
-                    
-        except queue.Empty:
-            pass
-        
-        if self.running:
-            self.root.after(100, self.check_voice_queue)
+            time.sleep(0.05)
     
     def stop_recognition(self):
         """Stop voice recognition and close window."""
-        self.running = False
-        self.root.destroy()
+        if self._focus_check_id:
+            self.root.after_cancel(self._focus_check_id)
+        self.recognizer.stop()
+        if self.root.winfo_exists():
+            self.root.destroy()
     
     def get_search_term(self):
         """Run the window and return the recognized command."""
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            if self._focus_check_id:
+                self.root.after_cancel(self._focus_check_id)
+            self.recognizer.stop()
         return self.result
 
 def main():
     """Main function handling the program flow."""
     print("\nComputer Vision-Based Object Location Tool")
     print("----------------------------------------")
-    print("Voice Recognition:")
-    
-    model_path = "vosk-model-en-us-0.22"
-    if os.path.exists(model_path):
-        print("✓ Using enhanced voice recognition model")
-    else:
-        print("! Using default voice recognition model")
-        print("\nTo install enhanced model (recommended), download using either:")
-        print("wget https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip")
-        print("curl -LO https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip")
-        print("\nThen extract to 'vosk-model-en-us-0.22' folder in script directory:")
-        print("unzip vosk-model-en-us-0.22.zip")
+    print("Voice Recognition: Using default model")
     
     print("\nControls:")
     print("- Press 'Alt+M' for text search")
     print("- Press 'Alt+N' for voice control")
     print("- Press Ctrl+C to exit\n")
-
-    running = True
-    while running:
+    
+    # Create an event to signal when to exit
+    exit_event = threading.Event()
+    
+    # Track key states with a dictionary to handle complex key combinations
+    key_states = {
+        'alt_l': False,        # State of left Alt key
+        'alt_r': False,        # State of right Alt key
+        'last_activation': 0,  # Timestamp of last hotkey activation
+        'tab_pressed': False,  # Whether Tab was pressed during this Alt press
+        'other_key_pressed': False,  # Whether any other key was pressed during this Alt press
+    }
+    
+    def on_press(key):
+        """Handle key press events.
+        
+        This function implements the following logic:
+        1. Prevents rapid-fire activation by checking time since last activation
+        2. Tracks Alt key state (both left and right Alt)
+        3. Resets state when Alt is pressed to allow new combinations
+        4. Tracks if Tab or other keys are pressed while Alt is down
+        5. Only triggers on clean Alt+M/N combinations (no other keys pressed)
+        """
         try:
-            # Wait for either hotkey
-            if keyboard.is_pressed('alt+m'):
-                # Text interface
-                keyboard.wait('alt+m', suppress=True)  # Wait for release to prevent double triggers
-                search_window = SearchWindow()
-                search_term = search_window.get_search_term()
-            elif keyboard.is_pressed('alt+n'):
-                # Voice interface
-                keyboard.wait('alt+n', suppress=True)  # Wait for release to prevent double triggers
-                voice_window = VoiceSearchWindow()
-                search_term = voice_window.get_search_term()
-            else:
-                # No hotkey pressed, continue checking
-                time.sleep(0.1)
-                continue
-            
-            if not search_term:
-                continue
-            
-            time.sleep(0.05)
-            handle_action(search_term)
-            
-        except KeyboardInterrupt:
-            print("\nExiting...")
-            running = False
+            current_time = time.time()
+            # Prevent rapid-fire activation (must wait 0.5s between activations)
+            if current_time - key_states['last_activation'] < 0.5:
+                return
+                
+            # When Alt is pressed, reset the state to allow new combinations
+            if key in (keyboard.Key.alt_l, keyboard.Key.alt):  # Note: some systems report alt_l as just alt
+                key_states['alt_l'] = True
+                key_states['other_key_pressed'] = False  # Reset other key flag
+                key_states['tab_pressed'] = False  # Reset tab flag
+            elif key == keyboard.Key.alt_r:
+                key_states['alt_r'] = True
+                key_states['other_key_pressed'] = False  # Reset other key flag
+                key_states['tab_pressed'] = False  # Reset tab flag
+            # If Tab is pressed while Alt is down, mark both Tab and other key as pressed
+            elif key == keyboard.Key.tab:
+                key_states['tab_pressed'] = True
+                key_states['other_key_pressed'] = True  # Tab counts as another key
+            # Only check for M/N if Alt is down and no other keys were pressed
+            elif (key_states['alt_l'] or key_states['alt_r']) and not key_states['other_key_pressed']:
+                if hasattr(key, 'char') and key.char:  # Ensure it's a character key
+                    if key.char.lower() == 'm':
+                        key_states['last_activation'] = current_time
+                        key_states['other_key_pressed'] = True  # Prevent further activations
+                        on_activate_text()
+                    elif key.char.lower() == 'n':
+                        key_states['last_activation'] = current_time
+                        key_states['other_key_pressed'] = True  # Prevent further activations
+                        on_activate_voice()
+                    else:
+                        # Any other character key pressed while Alt is down
+                        key_states['other_key_pressed'] = True
+        except AttributeError:
+            # Any non-character key pressed while Alt is down
+            key_states['other_key_pressed'] = True
+    
+    def on_release(key):
+        """Handle key release events.
+        
+        This function:
+        1. Resets Alt key states when released
+        2. Resets the "other key pressed" flag when Alt is released
+        3. Resets Tab state when Tab is released
+        """
+        if key in (keyboard.Key.alt_l, keyboard.Key.alt):
+            key_states['alt_l'] = False
+            key_states['other_key_pressed'] = False  # Reset when Alt is released
+        elif key == keyboard.Key.alt_r:
+            key_states['alt_r'] = False
+            key_states['other_key_pressed'] = False  # Reset when Alt is released
+        elif key == keyboard.Key.tab:
+            key_states['tab_pressed'] = False
+    
+    def on_activate_text():
+        """Handle text search activation."""
+        try:
+            search_window = SearchWindow()
+            search_term = search_window.get_search_term()
+            if search_term:
+                try:
+                    ActionHandler.handle_action(search_term)
+                except Exception as e:
+                    print(f"Error handling action: {str(e)}")
         except Exception as e:
-            print(f"Error: {str(e)}")
-            print(f"Error type: {type(e)}")
-            import traceback
-            traceback.print_exc()
-            if isinstance(e, KeyboardInterrupt):
-                running = False
+            print(f"Error in text search: {str(e)}")
+    
+    def on_activate_voice():
+        """Handle voice search activation."""
+        try:
+            voice_window = VoiceSearchWindow()
+            search_term = voice_window.get_search_term()
+            if search_term:
+                try:
+                    ActionHandler.handle_action(search_term)
+                except Exception as e:
+                    print(f"Error handling action: {str(e)}")
+        except Exception as e:
+            print(f"Error in voice search: {str(e)}")
+    
+    # Set up keyboard listeners
+    listener = keyboard.Listener(
+        on_press=on_press,
+        on_release=on_release
+    )
+    listener.start()
+    
+    try:
+        # Keep the main thread alive until Ctrl+C
+        exit_event.wait()
+    except KeyboardInterrupt:
+        print("\nExiting...")
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
+        print(f"Error type: {type(e)}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        listener.stop()
 
 if __name__ == "__main__":
     main()

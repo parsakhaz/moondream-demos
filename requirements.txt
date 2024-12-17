@@ -1,0 +1,6 @@
+requests
+Pillow
+PyAutoGUI
+pynput
+vosk
+pyaudio
