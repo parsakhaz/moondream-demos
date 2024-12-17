@@ -96,9 +96,6 @@ class BaseSearchWindow:
         self.setup_container()
         self.result = None
         
-        # Force focus immediately and repeatedly
-        self.force_focus()
-        
         # Bind window destruction
         self.root.protocol("WM_DELETE_WINDOW", self._on_destroy)
         
@@ -109,13 +106,12 @@ class BaseSearchWindow:
         
     def setup_window(self, window_height: int) -> None:
         """Configure window properties."""
-        # Set window properties for focus
+        # Set window properties
         self.root.attributes('-topmost', True)
         self.root.overrideredirect(True)
         self.root.lift()
-        self.root.focus_force()
         
-        # Disable minimize/maximize buttons (helps with focus on some systems)
+        # Disable minimize/maximize buttons
         self.root.resizable(False, False)
         
         # Center window
@@ -126,53 +122,6 @@ class BaseSearchWindow:
         center_y = int(screen_height/3)
         self.root.geometry(f'{window_width}x{window_height}+{center_x}+{center_y}')
         self.root.configure(bg=CONFIG['COLORS']['BG'])
-        
-        # Take focus from other windows
-        self.root.grab_set()
-        self.root.grab_release()
-        
-    def force_focus(self):
-        """Force window to take and maintain focus using multiple methods."""
-        def ensure_focus():
-            if not self._is_alive:
-                return
-            
-            try:
-                # Multiple methods to force focus
-                self.root.lift()  # Raise window to top
-                self.root.attributes('-topmost', True)  # Keep on top
-                self.root.focus_force()  # Force focus
-                self.root.update()  # Process pending events
-                
-                # Take focus from other windows temporarily
-                self.root.grab_set()
-                self.root.grab_release()
-                
-                # Schedule next focus check
-                if self._is_alive:
-                    self.root.after(50, ensure_focus)
-            except tk.TclError:
-                # Window was destroyed
-                self._is_alive = False
-        
-        # Initial focus
-        self.root.after(1, ensure_focus)
-        
-        # Additional one-time forceful focus after a slight delay
-        def delayed_focus():
-            if not self._is_alive:
-                return
-            
-            try:
-                self.root.lift()
-                self.root.focus_force()
-                self.root.grab_set()
-                self.root.grab_release()
-                self.root.update()
-            except tk.TclError:
-                self._is_alive = False
-        
-        self.root.after(100, delayed_focus)
     
     def setup_container(self) -> None:
         """Set up the main container frame."""
@@ -355,6 +304,8 @@ class CoordinateVisualizer:
         self.pulse_items = []
         self.selected_coords = None
         self.root = tk.Tk()
+        self.is_active = True
+        self.key_listener = None  # Initialize as None, will create when showing
         self.setup_window()
         
     def setup_window(self) -> None:
@@ -384,14 +335,39 @@ class CoordinateVisualizer:
         # Add instructions
         self.add_instructions()
         
-        # Bind events
-        self.root.bind('<Key>', self.on_key)
-        self.root.focus_force()
-        
         # Start animation
         self.pulse_size = 0
         self.pulse_growing = True
         self.animate_pulse()
+        
+        # Handle window close
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+    
+    def _on_close(self):
+        """Handle window closing."""
+        self.is_active = False
+        if self.key_listener:
+            self.key_listener.stop()
+            self.key_listener = None
+        self.root.destroy()
+    
+    def _on_key_press(self, key):
+        """Handle key press events from pynput."""
+        if not self.is_active:
+            return
+            
+        try:
+            # Check for Escape key
+            if key == keyboard.Key.esc:
+                self.root.quit()
+                return
+            
+            # Check for letter keys
+            if hasattr(key, 'char') and key.char in self.coord_map:
+                self.selected_coords = self.coord_map[key.char]
+                self.root.quit()
+        except Exception as e:
+            print(f"Error handling key press: {str(e)}")
     
     def draw_marker(self, x: int, y: int, letter: str) -> None:
         """Draw a single coordinate marker."""
@@ -465,6 +441,9 @@ class CoordinateVisualizer:
     
     def animate_pulse(self) -> None:
         """Animate the pulsing circles."""
+        if not self.is_active:
+            return
+            
         if self.pulse_growing:
             self.pulse_size += 1
             if self.pulse_size >= 20:
@@ -483,22 +462,32 @@ class CoordinateVisualizer:
                 y+self.marker_size+2+self.pulse_size
             )
         
-        if self.root.winfo_exists():
+        if self.is_active:
             self.root.after(20, self.animate_pulse)
-    
-    def on_key(self, event: tk.Event) -> None:
-        """Handle key press events."""
-        if event.char in self.coord_map:
-            self.selected_coords = self.coord_map[event.char]
-            self.root.quit()
-        elif event.keysym == 'Escape':
-            self.root.quit()
     
     def show(self) -> Optional[Tuple[int, int]]:
         """Show the visualization and return selected coordinates."""
-        self.root.mainloop()
-        self.root.destroy()
+        try:
+            # Set up keyboard listener only while window is shown
+            self.key_listener = keyboard.Listener(
+                on_press=self._on_key_press,
+                on_release=None
+            )
+            self.key_listener.start()
+            
+            # Run the window
+            self.root.mainloop()
+            
+        finally:
+            # Clean up
+            self.is_active = False
+            if self.key_listener:
+                self.key_listener.stop()
+                self.key_listener = None
+            if self.root.winfo_exists():
+                self.root.destroy()
         
+        # Handle click if coordinates were selected
         if self.selected_coords:
             time.sleep(0.05)
             ScreenHandler.touch_click(*self.selected_coords)
@@ -628,21 +617,19 @@ class SearchWindow(BaseSearchWindow):
         # Add shortcut hint
         self.add_shortcut_hint("alt+m to open, esc to close")
         
-        # Ensure focus
+        # Initial window setup
         self.root.update_idletasks()
         self.root.lift()
-        self.entry.focus_force()
+        self.root.attributes('-topmost', True)
         
-        # Keep focused
-        self._focus_check_id = None
-        self.ensure_focus()
-    
-    def ensure_focus(self):
-        """Ensure window stays focused."""
-        if self.root.winfo_exists():
-            self.root.lift()
+        # Click to focus - simple and effective
+        def click_entry():
+            x = int(self.root.winfo_x() + CONFIG['WINDOW']['WIDTH']//2)
+            y = int(self.root.winfo_y() + CONFIG['WINDOW']['HEIGHT']//2)
+            pyautogui.click(x, y)
             self.entry.focus_force()
-            self._focus_check_id = self.root.after(100, self.ensure_focus)
+        
+        self.root.after(50, click_entry)
     
     def on_entry_click(self, event):
         """Handle entry field click."""
@@ -661,8 +648,6 @@ class SearchWindow(BaseSearchWindow):
         text = self.search_var.get()
         if text and text != "Type to find anything...":
             self.result = text
-            if self._focus_check_id:
-                self.root.after_cancel(self._focus_check_id)
             self.root.destroy()
     
     def get_search_term(self):
@@ -670,8 +655,7 @@ class SearchWindow(BaseSearchWindow):
         try:
             self.root.mainloop()
         finally:
-            if self._focus_check_id:
-                self.root.after_cancel(self._focus_check_id)
+            self._is_alive = False
         return self.result
 
 class VoiceRecognizer:
@@ -794,7 +778,7 @@ class VoiceSearchWindow(BaseSearchWindow):
         self.add_shortcut_hint("esc to cancel")
         
         # Add loading spinner frames
-        self.spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self.spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "���"]
         self.spinner_idx = 0
         
         # Bind escape and window close
@@ -804,16 +788,6 @@ class VoiceSearchWindow(BaseSearchWindow):
         # Initialize voice recognition
         self.recognizer = VoiceRecognizer(self._on_voice_result)
         self.recognizer.start()
-        
-        # Keep focused
-        self._focus_check_id = None
-        self.ensure_focus()
-    
-    def ensure_focus(self):
-        """Ensure window stays focused."""
-        if self.root.winfo_exists():
-            self.root.lift()
-            self._focus_check_id = self.root.after(100, self.ensure_focus)
     
     def _on_voice_result(self, text, final=False):
         """Handle voice recognition results."""
@@ -844,8 +818,6 @@ class VoiceSearchWindow(BaseSearchWindow):
     
     def stop_recognition(self):
         """Stop voice recognition and close window."""
-        if self._focus_check_id:
-            self.root.after_cancel(self._focus_check_id)
         self.recognizer.stop()
         if self.root.winfo_exists():
             self.root.destroy()
@@ -855,8 +827,6 @@ class VoiceSearchWindow(BaseSearchWindow):
         try:
             self.root.mainloop()
         finally:
-            if self._focus_check_id:
-                self.root.after_cancel(self._focus_check_id)
             self.recognizer.stop()
         return self.result
 
