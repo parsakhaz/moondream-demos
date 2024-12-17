@@ -91,15 +91,32 @@ class BaseSearchWindow:
     def __init__(self, window_height: int = CONFIG['WINDOW']['HEIGHT']):
         self.root = tk.Tk()
         self.root.title("")
+        self._is_alive = True  # Track window state
         self.setup_window(window_height)
         self.setup_container()
         self.result = None
         
+        # Force focus immediately and repeatedly
+        self.force_focus()
+        
+        # Bind window destruction
+        self.root.protocol("WM_DELETE_WINDOW", self._on_destroy)
+        
+    def _on_destroy(self):
+        """Handle window destruction."""
+        self._is_alive = False
+        self.root.destroy()
+        
     def setup_window(self, window_height: int) -> None:
         """Configure window properties."""
+        # Set window properties for focus
         self.root.attributes('-topmost', True)
         self.root.overrideredirect(True)
         self.root.lift()
+        self.root.focus_force()
+        
+        # Disable minimize/maximize buttons (helps with focus on some systems)
+        self.root.resizable(False, False)
         
         # Center window
         window_width = CONFIG['WINDOW']['WIDTH']
@@ -110,6 +127,53 @@ class BaseSearchWindow:
         self.root.geometry(f'{window_width}x{window_height}+{center_x}+{center_y}')
         self.root.configure(bg=CONFIG['COLORS']['BG'])
         
+        # Take focus from other windows
+        self.root.grab_set()
+        self.root.grab_release()
+        
+    def force_focus(self):
+        """Force window to take and maintain focus using multiple methods."""
+        def ensure_focus():
+            if not self._is_alive:
+                return
+            
+            try:
+                # Multiple methods to force focus
+                self.root.lift()  # Raise window to top
+                self.root.attributes('-topmost', True)  # Keep on top
+                self.root.focus_force()  # Force focus
+                self.root.update()  # Process pending events
+                
+                # Take focus from other windows temporarily
+                self.root.grab_set()
+                self.root.grab_release()
+                
+                # Schedule next focus check
+                if self._is_alive:
+                    self.root.after(50, ensure_focus)
+            except tk.TclError:
+                # Window was destroyed
+                self._is_alive = False
+        
+        # Initial focus
+        self.root.after(1, ensure_focus)
+        
+        # Additional one-time forceful focus after a slight delay
+        def delayed_focus():
+            if not self._is_alive:
+                return
+            
+            try:
+                self.root.lift()
+                self.root.focus_force()
+                self.root.grab_set()
+                self.root.grab_release()
+                self.root.update()
+            except tk.TclError:
+                self._is_alive = False
+        
+        self.root.after(100, delayed_focus)
+    
     def setup_container(self) -> None:
         """Set up the main container frame."""
         self.container = tk.Frame(
@@ -147,7 +211,12 @@ class BaseSearchWindow:
         
     def get_search_term(self) -> Optional[str]:
         """Run the window and return the search term."""
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        except Exception as e:
+            print(f"Error in window mainloop: {str(e)}")
+        finally:
+            self._is_alive = False
         return self.result
 
 def countdown(seconds):
@@ -614,7 +683,7 @@ class VoiceRecognizer:
         self.recognition_thread = None
         self.last_text = ""
         self.last_speech_time = time.time()
-        self.silence_threshold = 0.8  # Reduced from 1.5 to 0.8 seconds for faster response
+        self.silence_threshold = 0.05  # Reduced to 50ms for immediate response
     
     def start(self):
         """Start voice recognition in a separate thread."""
